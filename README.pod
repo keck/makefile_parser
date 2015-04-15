@@ -1,0 +1,115 @@
+=head1 NAME
+
+makefile_parser
+
+=head1 DESCRIPTION
+
+Lexes and parses a GNU make file, and provides an interactive interface to aid in analysis.
+
+Things we Lex:
+ - variables
+ - targets/rules/macros
+ - blank lines
+ - comments
+ - continuations
+ - and directives (include, if(n)(eq|def)/etc)
+
+Things we Parse:
+
+ - Dependencies in the definition of a target/rule/macro
+ - Variable definitions
+
+ - Directives: conditional logic
+    - ifeq, ifneq, ifdef, ifndef, else, endif
+
+=head1 USAGE
+
+makefile_parser [/path/to/Makefile]
+
+ run with no argument, tries to read a file name 'Makefile' in your current working directory.
+
+=head1 REQUIREMENTS
+
+You need a Makefile to parse, and a perl interpreter, probably >= 5.6.
+
+=head1 DESIGN
+
+Makefiles contain five kinds of things:
+
+1)  explicit rules
+
+targets : prerequisites[ ; recipe ]
+    recipe
+
+2)  implicit rules
+
+(includes pattern rules, but skip for now)
+
+3)  variable definitions
+
+objects = main.o kbd.o command.o display.o \
+          insert.o search.o files.o utils.o
+
+4)  directives
+
+A directive is an instruction for make to do something special while reading the makefile. These include:
+
+    - Reading another makefile
+
+    include filenames...
+
+    - Deciding (based on the values of variables) whether to use or ignore a part of the makefile
+
+     ifeq ($(CC),gcc)
+       libs=$(libs_for_gcc)
+     else
+       libs=$(normal_libs)
+     endif
+
+    - Defining a variable from a verbatim string containing multiple lines
+
+    'define', 'override'.  Not used by us, ignoring.
+
+5)  comments
+
+    a '#' in a line of a makefile starts a comment. It and the rest of the line are
+    ignored, except that a trailing backslash not escaped by another backslash will
+    continue the comment across multiple lines. A line containing just a comment
+    (with perhaps spaces before it) is effectively blank, and is ignored. If you
+    want a literal #, escape it with a backslash (e.g., \#). Comments may appear on
+    any line in the makefile, although they are treated specially in certain
+    situations.
+
+    You cannot use comments within variable references or function calls: any
+    instance of # will be treated literally (rather than as the start of a comment)
+    inside a variable reference or function call.
+
+    Comments within a recipe are passed to the shell, just as with any other recipe
+    text. The shell decides how to interpret it: whether or not this is a comment
+    is up to the shell.
+
+    Within a define directive, comments are not ignored during the definition of
+    the variable, but rather kept intact in the value of the variable. When the
+    variable is expanded they will either be treated as make comments or as recipe
+    text, depending on the context in which the variable is evaluated.
+
+=head1 BUGS
+
+Pretty much definitely.  Please report them.  Or better yet submit a pull request.
+
+=head1 AUTHOR
+
+Nate Smith (github@perlhack.com)
+
+=head1 COMPANY
+
+Engineers Against Entropy
+
+=head1 CREATED_DATE
+
+2012.09.26
+
+=head1 REVISION
+
+1.0
+

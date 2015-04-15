@@ -1,0 +1,593 @@
+#!/usr/bin/env perl
+#===============================================================================
+#
+#         FILE:  makefile_parser
+#
+#        USAGE:  ./makefile_parser <Makefile>
+#
+#  DESCRIPTION:  Simple makefile deconstructor
+#
+#      OPTIONS:  ---
+# REQUIREMENTS:  ---
+#         BUGS:  ---
+#        NOTES:  ---
+#       AUTHOR:  Nate Smith (ns), github@perlhack.com
+#      VERSION:  1.0
+#      CREATED:  09/26/2012
+#     REVISION:  ---
+#===============================================================================
+use strict;
+use warnings;
+
+=head1 NAME
+
+makefile_parser
+
+=head1 DESCRIPTION
+
+Lexes and parses a GNU make file, and provides an interactive interface to aid in analysis.
+
+Things we Lex:
+ - variables
+ - targets/rules/macros
+ - blank lines
+ - comments
+ - continuations
+ - and directives (include, if(n)(eq|def)/etc)
+
+Things we Parse:
+
+ - Dependencies in the definition of a target/rule/macro
+ - Variable definitions
+
+ - Directives: conditional logic
+    - ifeq, ifneq, ifdef, ifndef, else, endif
+
+=head1 USAGE
+
+makefile_parser [/path/to/Makefile]
+
+ run with no argument, tries to read a file name 'Makefile' in your current working directory.
+
+=cut
+
+=head1 REQUIREMENTS
+
+You need a Makefile to parse, and a perl interpreter, probably >= 5.6.
+
+=cut
+
+=head1 DESIGN
+
+Makefiles contain five kinds of things:
+
+1)  explicit rules
+
+targets : prerequisites[ ; recipe ]
+    recipe
+
+2)  implicit rules
+
+(includes pattern rules, but skip for now)
+
+3)  variable definitions
+
+objects = main.o kbd.o command.o display.o \
+          insert.o search.o files.o utils.o
+
+4)  directives
+
+A directive is an instruction for make to do something special while reading the makefile. These include:
+
+    - Reading another makefile
+
+    include filenames...
+
+    - Deciding (based on the values of variables) whether to use or ignore a part of the makefile
+
+     ifeq ($(CC),gcc)
+       libs=$(libs_for_gcc)
+     else
+       libs=$(normal_libs)
+     endif
+
+    - Defining a variable from a verbatim string containing multiple lines
+
+    'define', 'override'.  Not used by us, ignoring.
+
+5)  comments
+
+    a '#' in a line of a makefile starts a comment. It and the rest of the line are
+    ignored, except that a trailing backslash not escaped by another backslash will
+    continue the comment across multiple lines. A line containing just a comment
+    (with perhaps spaces before it) is effectively blank, and is ignored. If you
+    want a literal #, escape it with a backslash (e.g., \#). Comments may appear on
+    any line in the makefile, although they are treated specially in certain
+    situations.
+
+    You cannot use comments within variable references or function calls: any
+    instance of # will be treated literally (rather than as the start of a comment)
+    inside a variable reference or function call.
+
+    Comments within a recipe are passed to the shell, just as with any other recipe
+    text. The shell decides how to interpret it: whether or not this is a comment
+    is up to the shell.
+
+    Within a define directive, comments are not ignored during the definition of
+    the variable, but rather kept intact in the value of the variable. When the
+    variable is expanded they will either be treated as make comments or as recipe
+    text, depending on the context in which the variable is evaluated.
+
+=cut
+
+=head1 BUGS
+
+Pretty much definitely.  Please report them.  Or better yet submit a pull request.
+
+=head1 AUTHOR
+
+Nate Smith (github@perlhack.com)
+
+=head1 COMPANY
+
+Engineers Against Entropy
+
+=head1 CREATED_DATE
+
+2012.09.26
+
+=head1 REVISION
+
+1.0
+
+=cut 
+
+
+
+my $DEBUG = 0;
+
+######## Get name of file ########
+my $mfname   = shift;
+my $default = './Makefile';
+
+# Objects we parse:
+#  $objs{x_rules}
+#  $objs{var_def}
+#  $objs{directive}
+my %objs;
+
+# Keep track of what uses each thing, too.
+my %used_by;
+
+unless ( (defined $mfname) && (-f $mfname) ) {
+  if ( -f $default ) {
+    $mfname = $default;
+  } else {
+    die "No input file.\n";
+  }
+}
+
+print "\n";
+print_info("Using $mfname as input file");
+
+
+####### Common Regexes #######
+
+# targets : prerequisites[ ; recipe ]
+#     recipe
+my $target_re      = qr/^(\S[^:]*)(::?)\s*(.*)$/;
+
+# objects = main.o kbd.o command.o display.o \
+#           insert.o search.o files.o utils.o
+my $vardef_re      = qr/^(?: \s*)?(\w+)\s*:?=\s*(.*)$/;
+
+my $cmdscript_re   = qr/^\t(.*?)$/;
+
+my $continue_re    = qr/\\$/;
+
+my $comment_re     = qr/^\s*\#/;
+
+my $blank_re       = qr/^\s*$/;
+
+# Parsing Conditionals
+#
+#    conditional-directive
+#    text-if-one-is-true
+#    else conditional-directive
+#    text-if-true
+#    else
+#    text-if-false
+#    endif
+#
+# Lines can start with a space, but not a tab, then any number of spaces or tabs,
+# followed by a conditional-directive, and it's clause.
+
+my $conditional_re = qr/^(?: \s*)?((:?ifn?def|ifn?eq) .*)$/;
+my $else_clause_re = qr/^(?: \s*)?else\b(.*)$/;
+my $endif_re       = qr/^(?: \s*)?endif\b/;
+
+
+# Includes, overrides.
+my $include_re     = qr/^(?: \s*)?(include .+)$/;
+my $override_re    = qr/^(?: \s*)?(override .+)$/;
+
+
+####### Slurp the file #######
+open( my $mfile, '<', $mfname ) or die "Couldn't open file $mfname\n$!";
+my @lines = <$mfile>;
+close $mfile;
+my $n_lines = scalar @lines;
+
+####### Begin line lexing/parsing #######
+
+my %seen; # Keep track of disposition of each line
+map { $seen{$_} = 0 } qw/comment     blank   var_def  rule_def cmd_script
+                         conditional include override other/;
+
+# If a non-continued line does not begin with a TAB character, it is never part
+# of a command script: it is always interpreted as makefile syntax. If a
+# non-continued line does begin with a TAB character, it is always part of a
+# command script: it is never interpreted as makefile syntax.
+my $LAST_TYPE = 'blank'; # Can be any of 'comment blank var_def rule_def cmd_script other'
+my $LAST_NAME = '';      # The name of the variable or rule being defined.
+
+
+# Continued lines are always of the same type as their predecessor, regardless of
+# what characters they start with.
+my $CONTINUED = 0;
+
+# $COND will refer to the last 'if/else' condition we saw, and it's line number
+my $COND  = '-';
+my $DEPTH = 0;
+
+my $n = 0;
+LINE : foreach my $l (@lines) {
+    $n++;
+    chomp $l;
+
+    if ( $l =~ $blank_re ) {
+        $seen{'blank'}++;
+        $LAST_TYPE = 'blank';
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+    }
+
+    if ( $l =~ $comment_re) {
+        $seen{'comment'}++;
+        $LAST_TYPE = 'comment';
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+    }
+
+    if ( $l =~ m/\#/ ) {
+        print "[CHECK] Is the following line ok if we s/\#.*\$// ?\n$l\n";
+    }
+
+    if ( $l =~ $vardef_re ) {
+
+        my ($var, $value) = map{ clean_ws($_) } ($1, $2);
+
+        if ( defined $objs{var_def}{$var} && $DEBUG ) {
+            print "[DEBUG] Attempted redefinition of var => '$var', value => '$value'\n";
+        }
+
+        $objs{var_def}{$var}{value} = $value;
+
+        print "[DEBUG] Parsed var_def; var => $var, value => $value\n" if $DEBUG;
+
+        $seen{'var_def'}++;
+        $LAST_TYPE = 'var_def';
+        $LAST_NAME = $var;
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+
+    } elsif ( $l =~ $target_re ) {
+
+        my ($trg, $ct, $dep ) = map{ clean_ws($_) } ($1, $2, $3 );
+
+        if ( defined $objs{x_rules}{$trg} && $DEBUG ) {
+            
+            print "[DEBUG] Ln $n Attempted redefinition of target => '$trg', deps => $dep, cond => $COND\n";
+            use Data::Dumper;
+            print Dumper $objs{x_rules}{$trg};
+
+        }
+
+        print "[DEBUG] Parsed ruledef; trg => $trg, ct => $ct, dep => $dep\n" if $DEBUG;
+
+        $objs{x_rules}{$trg}{ct}  = $ct;
+
+        # Break up the dependencies
+        my @deps   = split /\s+/, $dep;
+        my $n_deps = scalar @deps;
+
+        if ( $n_deps > 0 ){
+            print_info("Target ->$trg<- : adding $n_deps dependencies: ->$dep<-")
+                if $DEBUG;
+
+            map{
+                print "       Added dep ->$_<-\n" if $DEBUG;
+                push @{$objs{x_rules}{$trg}{deps}}, $_;
+                $used_by{$_}{$trg}++;
+               } @deps;
+        }
+
+        $seen{'rule_def'}++;
+        $LAST_TYPE = 'rule_def';
+        $LAST_NAME = $trg;
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+
+    } elsif ( $l =~ $cmdscript_re ) {
+
+        my $cmd = clean_ws($1);
+
+        if ($CONTINUED) {
+            if ( (($LAST_TYPE eq 'var_def') || ($LAST_TYPE eq 'rule_def'))
+              && (length $LAST_NAME) ) {
+                push @{ $objs{$LAST_TYPE}{$LAST_NAME}{cmd_script} }, $cmd;
+            } else {
+                print_err("Strange.  Continued a non-var_def or rule_def line (type was $LAST_TYPE, name was $LAST_NAME, on line $n)");
+            }
+        }
+
+        $seen{'cmd_script'}++;
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+
+    } elsif ( $l =~ $conditional_re ) {
+
+        my $cond = clean_ws($1);
+        $cond = ( length $cond ) ? $cond : '<none>';
+        $DEPTH++;
+        $COND = "$n:${cond}";
+        #printf( " Line %02d - %-40s # %-25s\n", $n, $l, "Begin condir ($COND) [DEPTH=$DEPTH]" );
+        printf( " Line %02d - %-40s # ", $n, $l );
+            print '  ' x $DEPTH, "Begin condir ($COND)\n";
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        $seen{'conditional'}++;
+        next LINE;
+
+    } elsif ( $l =~ $else_clause_re ) {
+
+        my $cond = clean_ws($1);
+        $cond = ( length $cond ) ? $cond : '<none>';
+        $COND = "$n:${cond}";
+        #printf( " Line %02d - %-40s # %-25s\n", $n, $l, "In 'else' clause ($COND) [DEPTH=$DEPTH]" );
+        printf( " Line %02d - %-40s # ", $n, $l );
+            print '  ' x $DEPTH, "In 'else' clause ($COND)\n";
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        $seen{'conditional'}++;
+        next LINE;
+
+    } elsif ( $l =~ $endif_re       ) {
+
+        $DEPTH--;
+        my $cond = ( $DEPTH ) ? $COND : '-';
+
+        $COND = "$n:${cond}";
+        #printf( " Line %02d - %-40s # %-25s\n", $n, $l, "End conditional ($COND) [DEPTH=$DEPTH]" );
+        printf( " Line %02d - %-40s # ", $n, $l );
+            print '  ' x $DEPTH, "End conditional ($COND)\n";
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        $seen{'conditional'}++;
+        next LINE;
+
+    } elsif ($l =~ $include_re) {
+
+        $seen{'include'}++;
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+
+    } elsif ($l =~ $override_re) {
+
+        $seen{'override'}++;
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+
+    } else {
+        print_err("Line $n: Unrecognized Line Type:\n$l\n");
+        $seen{'other'}++;
+        $CONTINUED = ( $l =~ $continue_re ) ? 1 : 0;
+        next LINE;
+    }
+
+}
+######## End line parsing ########
+
+my $used_lines_sum = 0;
+map { $used_lines_sum += $seen{$_} } keys %seen;
+
+my $disp_rpt = <<EORPT;
+
+  Parsed $n_lines lines in original Makefile
+
+  Dispensation Histogram
+
+    Variable Definition : $seen{'var_def'}
+    Rule Definition     : $seen{'rule_def'}
+    Command Script      : $seen{'cmd_script'}
+    Conditional         : $seen{'conditional'}
+    Comment             : $seen{'comment'}
+    Blank               : $seen{'blank'}
+    Include             : $seen{'include'}
+    Other               : $seen{'other'}
+    ---------------------------------------
+    Total               : $used_lines_sum
+
+EORPT
+
+print_info( split /\n/, $disp_rpt );
+print "\n";
+
+my @inspected;
+
+QUERY : while (1) {
+
+    print "\n Enter the name of a target to inspect: ";
+    my $ins = <STDIN>;
+    chomp $ins;
+    $ins = clean_ws($ins);
+
+    # check for it
+    if ( defined $objs{x_rules}{$ins} ) {
+
+        $objs{x_rules}{$ins}{used} = 1;
+        push @inspected, $ins;
+
+        rec_print_target( 0, 0, $ins, $objs{x_rules} );
+        next QUERY;
+
+    } elsif ( $ins eq "_cleanup_" ) {
+
+        @inspected = ();
+
+        foreach my $obj ( keys %{$objs{x_rules}} ) {
+            my $this = $objs{x_rules}{$obj};
+
+            if ( defined $this->{used} ) {
+                delete $this->{used};
+            }
+        }
+        next QUERY;
+
+    } elsif ( $ins eq "_unused_" ) {
+
+        if ( scalar @inspected ) {
+
+            print "  - After inspecting the following list and their prereqs:\n";
+            map { print "    * $_\n" } @inspected;
+
+            print "\n    The following targets appear to be unused:\n";
+
+            foreach my $obj ( keys %{$objs{x_rules}} ) {
+                my $this = $objs{x_rules}{$obj};
+
+                if ( ! defined $this->{used} ) {
+                    print "      - $obj\n";
+                }
+            }
+            next QUERY;
+
+        } else {
+            print "  - No targets have been inspected yet.  Do that first.\n";
+            next QUERY;
+        }
+    } elsif ( $ins =~ m/^\s*_used_by_\s+(\S+)$/ ) {
+
+        my $obj_name = clean_ws($1);
+
+        if ( defined $used_by{$obj_name} ) {
+
+            use Data::Dumper;
+            print Dumper $used_by{$obj_name};
+
+        }
+        next QUERY;
+
+
+    } elsif ( $ins =~ m/^_dump_\s+(\S+)$/ ) {
+
+        my $obj_name = clean_ws($1);
+
+        if ( defined $objs{x_rules}{$obj_name} ) {
+
+            use Data::Dumper;
+            print Dumper $objs{x_rules}{$obj_name};
+
+        }
+        next QUERY;
+
+    } else {
+        print "  - Sorry, no explicit rule by that name found.  Sorry!\n\n";
+        next QUERY;
+    }
+
+}
+
+sub rec_print_target {
+    my ( $indent, $idx, $t_name, $t_hash ) = @_;
+
+    if ( (ref $t_hash eq 'HASH')
+      && (defined $t_hash->{$t_name}) ) {
+
+        # Drop breadcrumbs..
+        $t_hash->{$t_name}{used} = 1;
+
+        # Tell me about yourself.
+        ( $indent == 0 )
+            ? print "Make target: $t_name\n"
+            : ( $indent == 1 )
+                ? printf "\n\n [%02d] - %s", $idx, $t_name
+                : print "\n", ' ' x ($indent * 4) , " [-]  $t_name";
+
+        # then, show off the pictures of the kids
+        if ( (defined $t_hash->{$t_name}{deps}       )
+          && (ref $t_hash->{$t_name}{deps} eq 'ARRAY') ) {
+
+
+            # This is a hack to make up for the fact that we don't handle
+            # conditionally (and thus multiply) defined targets yet.
+            # Keep track of which ones we've printed at this scope, so we
+            # don't print dupes.
+            my %printed = ();
+
+            DEP : for (my $c=0; $c<@{ $t_hash->{$t_name}{deps} }; $c++) {
+
+                my $obj_name = $t_hash->{$t_name}{deps}->[$c];
+
+                # And hey, the grandkids.
+                if ( defined $t_hash->{$obj_name} ) {
+
+                    # Unless I'm my own grandpa
+                    if ( defined $t_hash->{$obj_name}{used} ) {
+
+                        unless ( defined $printed{$obj_name} ) {
+                            $printed{$obj_name}++;
+                            print "\n", ' ' x ($indent * 4) , " [X] $t_name";
+                        }
+
+                        next DEP;
+                    } else {
+                        rec_print_target( $indent+1, $c+1, $obj_name, $t_hash );
+                        $printed{$obj_name}++;
+                    }
+
+                } else {
+                    next DEP;
+                }
+            }
+        }
+    }
+    return;
+}
+
+sub print_err {
+    if ( scalar @_ ) {
+        foreach my $l ( @_ ) {
+            print STDOUT "[ERROR] $l";
+            print STDOUT "\n"
+                unless ( $l =~ m/\n$/ );
+        }
+    }
+    return;
+}
+
+sub print_info {
+    if ( scalar @_ ) {
+        foreach my $l ( @_ ) {
+            print STDOUT "[INFO] $l";
+            print STDOUT "\n"
+                unless ( $l =~ m/\n$/ );
+        }
+    }
+    return;
+}
+
+
+sub clean_ws {
+    my $in = shift;
+       $in =~ s/^\s*//;
+       $in =~ s/\s*$//;
+return $in;
+}
